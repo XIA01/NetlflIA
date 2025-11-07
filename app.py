@@ -1,4 +1,3 @@
-# app.py
 import sys
 import torch
 import traceback
@@ -13,50 +12,41 @@ from PySide6.QtCore import Qt, QThread, Signal
 from diffusers import DiffusionPipeline
 from PIL import Image
 
+# =======================================================
+#  🔧 CONFIGURACIÓN GLOBAL
+# =======================================================
+MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =======================================================
+#  🧩 HILO DE GENERACIÓN
+# =======================================================
 class GenerationThread(QThread):
     progress = Signal(int)
     finished = Signal(Image.Image)
     error = Signal(str)
+    cancelled = False
 
-    def __init__(self, prompt):
+    def __init__(self, prompt, pipe):
         super().__init__()
         self.prompt = prompt
+        self.pipe = pipe
 
     def run(self):
         try:
             if not torch.cuda.is_available():
-                raise RuntimeError("CUDA no disponible.")
+                raise RuntimeError("CUDA no disponible en el sistema.")
 
-            # Forzar gestión de memoria
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-            # Cargar modelo
-            pipe = DiffusionPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-xl-base-1.0",
-                dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True
-            )
-
-            # Optimizar VRAM
-            pipe.enable_sequential_cpu_offload()
-            pipe.enable_vae_tiling()
-            pipe.enable_vae_slicing()
-            pipe.enable_attention_slicing()
-
-            try:
-                pipe.enable_xformers_memory_efficient_attention()
-            except Exception:
-                print("[AVISO] xformers no disponible.")
-
-            # Callback
+            # Callback de progreso
             def callback(pipe, step: int, timestep: int, callback_kwargs):
-                if step <= 28:
-                    self.progress.emit(int(step / 28 * 100))
+                if self.cancelled:
+                    raise KeyboardInterrupt("Generación cancelada por el usuario.")
+                progress = min(int(step / 28 * 100), 100)
+                self.progress.emit(progress)
                 return callback_kwargs
 
-            # Generar
-            image = pipe(
+            # Generar imagen
+            image = self.pipe(
                 prompt=self.prompt,
                 negative_prompt="borroso, feo, deformado, low quality, watermark, bad anatomy, extra limbs, text, ugly",
                 num_inference_steps=28,
@@ -66,21 +56,27 @@ class GenerationThread(QThread):
                 callback_on_step_end=callback
             ).images[0]
 
-            # LIMPIEZA AUTOMÁTICA DE MEMORIA
-            del pipe
-            del image
+            # Emitir antes de limpiar
+            self.finished.emit(image)
+
+            # Limpieza ligera
             gc.collect()
             torch.cuda.empty_cache()
 
-            self.finished.emit(image)
-
+        except KeyboardInterrupt:
+            print("[INFO] Generación cancelada.")
+            self.error.emit("Cancelado por el usuario.")
         except Exception as e:
-            error_msg = f"{type(e).__name__}: {str(e)}"
-            print("\nERROR en hilo:")
             print(traceback.format_exc())
-            self.error.emit(error_msg)
+            self.error.emit(f"{type(e).__name__}: {str(e)}")
+
+    def cancel(self):
+        self.cancelled = True
 
 
+# =======================================================
+#  🖥️ INTERFAZ PRINCIPAL
+# =======================================================
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -101,6 +97,7 @@ class MainWindow(QWidget):
         self.prompt_input.setFixedHeight(80)
         layout.addWidget(self.prompt_input)
 
+        # Botones
         self.generate_btn = QPushButton("Generar Imagen")
         self.generate_btn.setStyleSheet("""
             QPushButton {
@@ -112,6 +109,12 @@ class MainWindow(QWidget):
         """)
         self.generate_btn.clicked.connect(self.start_generation)
         layout.addWidget(self.generate_btn)
+
+        self.cancel_btn = QPushButton("Cancelar")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setStyleSheet("background: #ff4040; color: white; border-radius: 8px; padding: 10px;")
+        self.cancel_btn.clicked.connect(self.cancel_generation)
+        layout.addWidget(self.cancel_btn)
 
         self.progress = QProgressBar()
         self.progress.setStyleSheet("""
@@ -127,8 +130,46 @@ class MainWindow(QWidget):
         layout.addWidget(self.image_label)
 
         self.setLayout(layout)
+
+        # Cargar modelo una sola vez
+        self.pipe = None
+        self.load_model()
+
         self.thread = None
 
+    # =======================================================
+    #  CARGA DEL MODELO
+    # =======================================================
+    def load_model(self):
+        try:
+            self.image_label.setText("Cargando modelo SDXL... (puede tardar unos segundos)")
+            QApplication.processEvents()
+
+            self.pipe = DiffusionPipeline.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.float16,
+                variant="fp16",
+                use_safetensors=True
+            )
+            self.pipe.to("cuda")
+
+            # Optimización de memoria
+            self.pipe.enable_vae_tiling()
+            self.pipe.enable_vae_slicing()
+            self.pipe.enable_attention_slicing()
+            try:
+                self.pipe.enable_xformers_memory_efficient_attention()
+                print("[INFO] xFormers habilitado.")
+            except Exception:
+                print("[AVISO] xFormers no disponible.")
+
+            self.image_label.setText("✅ Modelo cargado. Escribe un prompt y genera.")
+        except Exception as e:
+            self.image_label.setText(f"Error al cargar modelo: {e}")
+
+    # =======================================================
+    #  GENERACIÓN
+    # =======================================================
     def start_generation(self):
         prompt = self.prompt_input.toPlainText().strip()
         if not prompt:
@@ -136,15 +177,24 @@ class MainWindow(QWidget):
             return
 
         self.generate_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
         self.progress.setValue(0)
-        self.image_label.setText("Generando...")
+        self.image_label.setText("🧠 Generando...")
 
-        self.thread = GenerationThread(prompt)
+        self.thread = GenerationThread(prompt, self.pipe)
         self.thread.progress.connect(self.progress.setValue)
         self.thread.finished.connect(self.show_image)
         self.thread.error.connect(self.show_error)
         self.thread.start()
 
+    def cancel_generation(self):
+        if self.thread and self.thread.isRunning():
+            self.thread.cancel()
+            self.cancel_btn.setEnabled(False)
+
+    # =======================================================
+    #  RESULTADOS
+    # =======================================================
     def show_image(self, img: Image.Image):
         output_path = "ultima_generacion.png"
         img.save(output_path)
@@ -153,18 +203,23 @@ class MainWindow(QWidget):
         )
         self.image_label.setPixmap(pixmap)
         self.generate_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
         self.progress.setValue(100)
 
-        # LIMPIEZA FINAL (por si quedó algo)
         torch.cuda.empty_cache()
 
     def show_error(self, error_msg: str):
-        self.image_label.setText(f"Error: {error_msg}")
+        self.image_label.setText(f"⚠️ {error_msg}")
         self.generate_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
         self.progress.setValue(0)
-        print(f"\n[GUI Error] {error_msg}")
+        print(f"[GUI Error] {error_msg}")
+        torch.cuda.empty_cache()
 
 
+# =======================================================
+#  MAIN
+# =======================================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
