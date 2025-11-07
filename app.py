@@ -1,25 +1,29 @@
+# app.py
 import sys
 import torch
-import traceback
 import os
 import gc
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QTextEdit, QPushButton,
-    QVBoxLayout, QProgressBar, QMessageBox
+    QApplication, QMainWindow, QHBoxLayout, QVBoxLayout, QWidget,
+    QLabel, QTextEdit, QPushButton, QProgressBar, QScrollArea,
+    QGroupBox, QMessageBox
 )
 from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Qt, QThread, Signal
 from diffusers import DiffusionPipeline
 from PIL import Image
 
+from pipelines.movie_project import MovieProjectManager
+from pipelines.sinopsis import SinopsisGenerator
+
 # =======================================================
-#  🔧 CONFIGURACIÓN GLOBAL
+#  CONFIGURACIÓN GLOBAL
 # =======================================================
 MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # =======================================================
-#  🧩 HILO DE GENERACIÓN
+#  HILO DE GENERACIÓN
 # =======================================================
 class GenerationThread(QThread):
     progress = Signal(int)
@@ -34,18 +38,12 @@ class GenerationThread(QThread):
 
     def run(self):
         try:
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA no disponible en el sistema.")
-
-            # Callback de progreso
             def callback(pipe, step: int, timestep: int, callback_kwargs):
                 if self.cancelled:
-                    raise KeyboardInterrupt("Generación cancelada por el usuario.")
-                progress = min(int(step / 28 * 100), 100)
-                self.progress.emit(progress)
+                    raise KeyboardInterrupt()
+                self.progress.emit(min(int(step / 28 * 100), 100))
                 return callback_kwargs
 
-            # Generar imagen
             image = self.pipe(
                 prompt=self.prompt,
                 negative_prompt="borroso, feo, deformado, low quality, watermark, bad anatomy, extra limbs, text, ugly",
@@ -56,18 +54,13 @@ class GenerationThread(QThread):
                 callback_on_step_end=callback
             ).images[0]
 
-            # Emitir antes de limpiar
             self.finished.emit(image)
-
-            # Limpieza ligera
             gc.collect()
             torch.cuda.empty_cache()
 
         except KeyboardInterrupt:
-            print("[INFO] Generación cancelada.")
             self.error.emit("Cancelado por el usuario.")
         except Exception as e:
-            print(traceback.format_exc())
             self.error.emit(f"{type(e).__name__}: {str(e)}")
 
     def cancel(self):
@@ -75,116 +68,239 @@ class GenerationThread(QThread):
 
 
 # =======================================================
-#  🖥️ INTERFAZ PRINCIPAL
+#  WIDGETS DE RESULTADOS
 # =======================================================
-class MainWindow(QWidget):
+class ResultWidget(QGroupBox):
+    def __init__(self, title):
+        super().__init__(title)
+        self.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                color: #00bfff; 
+                border: 2px solid #333; 
+                border-radius: 10px; 
+                margin: 10px; 
+                padding: 10px;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+        """)
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+    def add_text(self, text):
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: #e0e0e0; margin: 5px;")
+        self.layout.addWidget(label)
+
+
+# =======================================================
+#  MAIN WINDOW
+# =======================================================
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NetflIA - SDXL Local @Como_Critica")
-        self.setGeometry(100, 100, 720, 820)
-        self.setStyleSheet("background: #1a1a1a; color: #e0e0e0; font-family: Ubuntu, Arial;")
+        self.setWindowTitle("NetflIA - Películas con IA Local")
+        self.setGeometry(100, 100, 1400, 900)
+        self.setStyleSheet("background: #1a1a1a;")
 
-        layout = QVBoxLayout()
+        # === Layout principal ===
+        central = QWidget()
+        self.main_layout = QHBoxLayout(central)
+        self.setCentralWidget(central)
 
-        title = QLabel("Generador IA Local - RTX 3060")
+        # === Columna Izquierda: Controles ===
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+
+        # Título
+        title = QLabel("NetflIA - Generador de Películas")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 20px; font-weight: bold; padding: 10px; color: #00bfff;")
-        layout.addWidget(title)
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #00bfff; margin: 10px;")
+        left_col.addWidget(title)
 
+        # Botones secuenciales
+        self.info_btn = self.create_step_btn("1. Info del Proyecto", self.open_project_form)
+        left_col.addWidget(self.info_btn)
+
+        self.sinopsis_btn = self.create_step_btn("2. Generar Sinopsis", None)
+        self.sinopsis_btn.setEnabled(False)
+        left_col.addWidget(self.sinopsis_btn)
+
+        # Prompt + Generar
         self.prompt_input = QTextEdit()
-        self.prompt_input.setPlaceholderText("Ej: Un mate con vapor, mesa de madera, luz natural, hiperrealista...")
-        self.prompt_input.setStyleSheet("background: #2d2d2d; padding: 12px; border-radius: 8px; font-size: 14px;")
+        self.prompt_input.setPlaceholderText("Ej: Un gaucho en la luna, estilo realista...")
         self.prompt_input.setFixedHeight(80)
-        layout.addWidget(self.prompt_input)
+        self.prompt_input.setStyleSheet("background: #2d2d2d; color: white; padding: 10px; border-radius: 8px;")
+        left_col.addWidget(self.prompt_input)
 
-        # Botones
+        self.load_model_btn = QPushButton("Cargar Modelos")
+        self.load_model_btn.setStyleSheet(self.btn_style("f0ad4e"))
+        self.load_model_btn.clicked.connect(self.load_model)
+        left_col.addWidget(self.load_model_btn)
+
         self.generate_btn = QPushButton("Generar Imagen")
-        self.generate_btn.setStyleSheet("""
-            QPushButton {
-                background: #00bfff; color: white; padding: 14px;
-                border-radius: 10px; font-weight: bold; font-size: 16px;
-            }
-            QPushButton:disabled { background: #555; }
-            QPushButton:hover:!disabled { background: #00a0d4; }
-        """)
+        self.generate_btn.setStyleSheet(self.btn_style("00bfff"))
         self.generate_btn.clicked.connect(self.start_generation)
-        layout.addWidget(self.generate_btn)
+        left_col.addWidget(self.generate_btn)
 
         self.cancel_btn = QPushButton("Cancelar")
         self.cancel_btn.setEnabled(False)
-        self.cancel_btn.setStyleSheet("background: #ff4040; color: white; border-radius: 8px; padding: 10px;")
+        self.cancel_btn.setStyleSheet(self.btn_style("ff4040"))
         self.cancel_btn.clicked.connect(self.cancel_generation)
-        layout.addWidget(self.cancel_btn)
+        left_col.addWidget(self.cancel_btn)
 
         self.progress = QProgressBar()
-        self.progress.setStyleSheet("""
-            QProgressBar { border-radius: 8px; text-align: center; }
-            QProgressBar::chunk { background: #00bfff; border-radius: 8px; }
-        """)
-        layout.addWidget(self.progress)
+        self.progress.setStyleSheet("QProgressBar::chunk { background: #00bfff; }")
+        left_col.addWidget(self.progress)
 
-        self.image_label = QLabel("→ Escribe un prompt y haz clic en 'Generar'")
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("background: #252525; border: 2px dashed #444; border-radius: 12px; margin: 10px; padding: 20px;")
-        self.image_label.setMinimumHeight(420)
-        layout.addWidget(self.image_label)
+        # === Columna Derecha: Resultados (Scroll) ===
+        self.results_area = QScrollArea()
+        self.results_area.setWidgetResizable(True)
+        self.results_area.setStyleSheet("background: #222; border: none;")
+        self.results_widget = QWidget()
+        self.results_layout = QVBoxLayout(self.results_widget)
+        self.results_area.setWidget(self.results_widget)
 
-        self.setLayout(layout)
+        # Añadir columnas
+        self.main_layout.addLayout(left_col, 1)
+        self.main_layout.addWidget(self.results_area, 2)
 
-        # Cargar modelo una sola vez
+        # === Cargar modelo ===
         self.pipe = None
-        self.load_model()
-
         self.thread = None
+        self.project_manager = None
+        self.project_data = None
 
     # =======================================================
-    #  CARGA DEL MODELO
+    #  UTILIDADES
+    # =======================================================
+    def create_step_btn(self, text, callback):
+        btn = QPushButton(text)
+        btn.setStyleSheet(self.btn_style("00bfff"))
+        if callback:
+            btn.clicked.connect(callback)
+        return btn
+
+    def btn_style(self, color):
+        return f"""
+            QPushButton {{ background: #{color}; color: white; padding: 12px; border-radius: 8px; font-weight: bold; }}
+            QPushButton:disabled {{ background: #555; color: #aaa; }}
+            QPushButton:hover:!disabled {{ background: #{color}dd; }}
+        """
+
+    # =======================================================
+    #  MODELO
     # =======================================================
     def load_model(self):
         try:
-            self.image_label.setText("Cargando modelo SDXL... (puede tardar unos segundos)")
+            self.add_result("Cargando SDXL...", "Cargando modelo...")
             QApplication.processEvents()
 
             self.pipe = DiffusionPipeline.from_pretrained(
-                MODEL_ID,
-                torch_dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True
+                MODEL_ID, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
             )
             self.pipe.to("cuda")
-
-            # Optimización de memoria
             self.pipe.enable_vae_tiling()
             self.pipe.enable_vae_slicing()
             self.pipe.enable_attention_slicing()
             try:
                 self.pipe.enable_xformers_memory_efficient_attention()
-                print("[INFO] xFormers habilitado.")
-            except Exception:
-                print("[AVISO] xFormers no disponible.")
+            except: pass
 
-            self.image_label.setText("✅ Modelo cargado. Escribe un prompt y genera.")
+            self.add_result("Modelo cargado", "Listo para generar.")
         except Exception as e:
-            self.image_label.setText(f"Error al cargar modelo: {e}")
+            self.add_result("Error", str(e))
 
     # =======================================================
-    #  GENERACIÓN
+    #  RESULTADOS
+    # =======================================================
+    def add_result(self, title, content):
+        widget = ResultWidget(title)
+        widget.add_text(content)
+        self.results_layout.addWidget(widget)
+        self.results_area.verticalScrollBar().setValue(self.results_area.verticalScrollBar().maximum())
+
+    def clear_results(self):
+        for i in reversed(range(self.results_layout.count())):
+            self.results_layout.itemAt(i).widget().deleteLater()
+
+    # =======================================================
+    #  PASO 1: FORMULARIO
+    # =======================================================
+    def open_project_form(self):
+        if not self.project_manager:
+            self.project_manager = MovieProjectManager()
+            self.project_manager.saved.connect(self.on_project_saved)
+        self.project_manager.show()
+
+    def on_project_saved(self, data):
+        self.project_data = data
+        self.sinopsis_btn.setEnabled(True)
+        self.sinopsis_btn.clicked.connect(self.generate_sinopsis)
+
+        # Mostrar datos en columna derecha
+        self.add_result("Sinopsis - Datos del Proyecto", self.format_project_data(data))
+
+    def format_project_data(self, data):
+        lines = [
+            f"<b>Título:</b> {data['title']}",
+            f"<b>Duración:</b> {data['duration']} min",
+            f"<b>Género:</b> {data['genre']}",
+            f"<b>Tipo:</b> {'Serie' if data['is_series'] else 'Película'}",
+        ]
+        if data['is_series']:
+            lines.append(f"<b>Capítulos:</b> {data['episodes']}")
+        lines.append(f"<b>Protagonistas:</b> {data['prota_names'] or 'No especificados'}")
+        lines.append(f"<b>Final:</b> {data['final_type']}")
+        if data['extra_details']:
+            lines.append(f"<b>Detalles:</b> {data['extra_details']}")
+        return "<br>".join(lines)
+
+    # =======================================================
+    #  PASO 2: SINOPSIS
+    # =======================================================
+    def generate_sinopsis(self):
+        if not self.project_data:
+            return
+        self.sinopsis_btn.setEnabled(False)
+        self.add_result("Sinopsis", "Generando con Qwen-7B...")
+
+        # Aquí irá vLLM
+        sinopsis = SinopsisGenerator().generate(self.project_data)
+        # sinopsis = "Sinopsis generada automáticamente..."  # ← Placeholder
+
+        # Reemplazar último widget
+        last = self.results_layout.itemAt(self.results_layout.count() - 1).widget()
+        last.deleteLater()
+        widget = ResultWidget("Sinopsis")
+        widget.add_text(sinopsis)
+        regen_btn = QPushButton("Regenerar Sinopsis")
+        regen_btn.setStyleSheet(self.btn_style("ff6b6b"))
+        regen_btn.clicked.connect(self.generate_sinopsis)
+        widget.layout.addWidget(regen_btn)
+        self.results_layout.addWidget(widget)
+        self.sinopsis_btn.setEnabled(True)
+
+    # =======================================================
+    #  GENERACIÓN DE IMAGEN
     # =======================================================
     def start_generation(self):
-        prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            QMessageBox.warning(self, "Falta prompt", "Escribe algo para generar.")
+        if not self.pipe:
+            QMessageBox.warning(self, "Error", "Por favor, carga los modelos antes de generar una imagen.")
             return
 
+        prompt = self.prompt_input.toPlainText().strip()
+        if not prompt:
+            QMessageBox.warning(self, "Error", "Escribe un prompt.")
+            return
         self.generate_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.progress.setValue(0)
-        self.image_label.setText("🧠 Generando...")
-
         self.thread = GenerationThread(prompt, self.pipe)
         self.thread.progress.connect(self.progress.setValue)
         self.thread.finished.connect(self.show_image)
-        self.thread.error.connect(self.show_error)
+        self.thread.error.connect(lambda e: self.add_result("Error", e))
         self.thread.start()
 
     def cancel_generation(self):
@@ -192,29 +308,19 @@ class MainWindow(QWidget):
             self.thread.cancel()
             self.cancel_btn.setEnabled(False)
 
-    # =======================================================
-    #  RESULTADOS
-    # =======================================================
     def show_image(self, img: Image.Image):
-        output_path = "ultima_generacion.png"
-        img.save(output_path)
-        pixmap = QPixmap(output_path).scaled(
-            660, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.image_label.setPixmap(pixmap)
+        path = "ultima_generacion.png"
+        img.save(path)
+        pixmap = QPixmap(path).scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        widget = ResultWidget("Imagen Generada")
+        label = QLabel()
+        label.setPixmap(pixmap)
+        label.setAlignment(Qt.AlignCenter)
+        widget.layout.addWidget(label)
+        self.results_layout.addWidget(widget)
         self.generate_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.progress.setValue(100)
-
-        torch.cuda.empty_cache()
-
-    def show_error(self, error_msg: str):
-        self.image_label.setText(f"⚠️ {error_msg}")
-        self.generate_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        self.progress.setValue(0)
-        print(f"[GUI Error] {error_msg}")
-        torch.cuda.empty_cache()
 
 
 # =======================================================
